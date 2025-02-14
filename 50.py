@@ -423,7 +423,7 @@ st.markdown(
     }
     </style>
     <div class="footer">
-        <p> Rice Crop Disease Detection &copy; 2024</p>
+        <p> Rice Crop Disease Detection &copy; 2025</p>
     </div>
     """,
     unsafe_allow_html=True
