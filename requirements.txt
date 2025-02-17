@@ -1,8 +1,7 @@
-tensorflow 
-pillow 
-numpy 
-streamlit 
-googletrans==4.0.0-rc1 
-json5
-opencv-python-headless
-opencv-python-4.11.0.86
+tensorflow==2.18.0
+pillow==11.1.0
+numpy==2.2.3
+streamlit==1.42.0
+googletrans==4.0.0-rc1
+json5==0.10.0
+opencv-python-headless==4.11.0.86
