@@ -3,7 +3,7 @@ pillow
 numpy 
 streamlit 
 googletrans==4.0.0-rc1 
-opencv-python 
 json5
+pip uninstall opencv-python opencv-python-headless
 opencv-python-headless==4.5.5.64
-
+opencv-python
