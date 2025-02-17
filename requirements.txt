@@ -6,4 +6,5 @@ googletrans==4.0.0-rc1
 opencv-python 
 json5
 opencv-python-headless
+cv2
 
