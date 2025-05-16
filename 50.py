@@ -5,8 +5,8 @@ from PIL import Image
 import numpy as np
 import streamlit as st
 import base64 
-from googletrans import Translator
-import cv2
+from googletrans import Translator 
+import cv2 
 
 st.set_page_config(layout='centered')
 
@@ -322,7 +322,7 @@ def estimate_yield_growth_and_loss(disease, severity_score):
         # Display yield growth first, followed by yield loss
         return f"Yield Growth: {yield_growth}% | Yield Loss: {yield_loss}%"
     else:
-        return "No yield loss and growth data available"
+        return "No yield loss"
 
 # Initialize the translator
 translator = Translator()
