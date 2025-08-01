@@ -325,12 +325,22 @@ def estimate_yield_growth_and_loss(disease, severity_score):
         return "No yield loss"
 
 # Initialize the translator
-translator = Translator()
+translator = None
+try:
+    translator = Translator()
+except Exception as e:
+    print(f"Warning: Translation service initialization failed: {e}")
 
 # Function to translate text
 def translate_text(text, dest_language):
-    translation = translator.translate(text, dest=dest_language)
-    return translation.text
+    try:
+        if translator is None:
+            return text
+        translation = translator.translate(text, dest=dest_language)
+        return translation.text
+    except Exception as e:
+        print(f"Warning: Translation failed: {e}")
+        return text  # Return original text if translation fails
 
 # Function to display text based on selected language
 def display_text(text, language):
