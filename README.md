@@ -1,5 +1,1 @@
-# CropDiseaseResources
-
-Research Paper -> SOTA Model -> Update
-
-Arch_>
+CropDiseaseResources
