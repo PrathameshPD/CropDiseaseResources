@@ -1,1 +1,519 @@
-python-3.10
+import warnings
+warnings.filterwarnings("ignore")
+import pandas as pd
+from tqdm import tqdm
+import json
+from dotenv import load_dotenv
+import os
+from datetime import timedelta
+import numpy as np
+from io import BytesIO
+from modules.llm_client.common_utils import AzureChatClient
+
+load_dotenv()
+
+class GasDataProcessor:
+    def __init__(self, sap_base_gas_df, km_base_gas_df):
+        self.df_sap = sap_base_gas_df.copy()
+        self.df_km = km_base_gas_df.copy()
+        self.cleaned_km_df = None
+        self.cleaned_sap_df = None
+        self.structured_km_df = None
+        self.structured_sap_df = None
+
+    def clean_km_data(self):
+        """Clean KM data and store in cleaned_km_df"""
+        required_columns = [
+            'End Date/Time', 'KM Order#', 'Customer Order #', 'BATCH #',
+            'Mode of Transport', 'Source Container', 'Destination Container', 'R/D',
+            'Product', 'Custody Volume'
+        ]
+        missing_cols = [col for col in required_columns if col not in self.df_km.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns in KM data: {missing_cols}")
+
+        self.cleaned_km_df = self.df_km[required_columns].copy()
+        self.cleaned_km_df = self.cleaned_km_df.rename(columns={"R/D": "R/D KM", "Product": "Product KM"})
+
+        self.cleaned_km_df["R/D_cleaned"] = (
+            self.cleaned_km_df["R/D KM"].astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace(r'\s+', ' ', regex=True)
+        )
+        self.cleaned_km_df = self.cleaned_km_df[self.cleaned_km_df["R/D_cleaned"] != 'zero']
+        self.cleaned_km_df.drop(columns=["R/D_cleaned"], inplace=True)
+        self.cleaned_km_df.reset_index(drop=True, inplace=True)
+        
+        print(f"KM data cleaned: {len(self.cleaned_km_df)} records retained")
+        return self.cleaned_km_df
+
+    def clean_sap_data(self):
+        """Clean SAP data and store in cleaned_sap_df"""
+        required_columns = [
+            'Product', 'R/D', 'MovementType', 'Movement Date', 'BOL',
+            'Nomination Number', 'Inventory Qty', 'Month', 'Comments'
+        ]
+        missing_cols = [col for col in required_columns if col not in self.df_sap.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns in SAP data: {missing_cols}")
+
+        self.cleaned_sap_df = self.df_sap[required_columns].copy()
+        self.cleaned_sap_df = self.cleaned_sap_df.rename(columns={"R/D": "R/D SAP", "Product": "Product SAP"})
+
+        self.cleaned_sap_df['Comments_cleaned'] = (
+            self.cleaned_sap_df['Comments']
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace(r'\s+', ' ', regex=True)
+        )
+        self.cleaned_sap_df = self.cleaned_sap_df[self.cleaned_sap_df['Comments_cleaned'] != 'zero']
+        self.cleaned_sap_df.drop(columns=['Comments_cleaned', 'Month', 'Comments'], inplace=True)
+
+        self.cleaned_sap_df = self.cleaned_sap_df[self.cleaned_sap_df['Product SAP'].isin(['#25DSL ULS 15', '#2HO ULS 15'])]
+        self.cleaned_sap_df.reset_index(drop=True, inplace=True)
+        
+        print(f"SAP data cleaned: {len(self.cleaned_sap_df)} records retained")
+        return self.cleaned_sap_df
+
+    def structure_sap_data(self):
+        """Structure SAP data and store in structured_sap_df"""
+        if self.cleaned_sap_df is None:
+            raise ValueError("SAP data must be cleaned first. Call clean_sap_data() first.")
+        
+        def filter_by_mode_and_rd(mode):
+            mode_filter = self.cleaned_sap_df['MovementType'].str.lower() == mode.lower()
+            receipts = self.cleaned_sap_df[mode_filter & (self.cleaned_sap_df['R/D SAP'].str.lower() == 'receipt')]
+            delivery = self.cleaned_sap_df[mode_filter & (self.cleaned_sap_df['R/D SAP'].str.lower() == 'delivery')]
+            hashtag = self.cleaned_sap_df[mode_filter & (self.cleaned_sap_df['R/D SAP'].str.lower() == '#')]
+            return pd.concat([receipts, delivery, hashtag], ignore_index=True)
+
+        modes = ['in-tank/inter-tank', 'barge', 'pipeline', 'vessel', 'not assigned']
+        structured_dfs = []
+        
+        for mode in modes:
+            mode_df = filter_by_mode_and_rd(mode)
+            if not mode_df.empty:
+                structured_dfs.append(mode_df)
+
+        self.structured_sap_df = pd.concat(structured_dfs, ignore_index=True) if structured_dfs else pd.DataFrame()
+        
+        print(f"SAP data structured: {len(self.structured_sap_df)} records")
+        return self.structured_sap_df
+
+    def structure_km_data(self):
+        """Structure KM data and store in structured_km_df"""
+        if self.cleaned_km_df is None:
+            raise ValueError("KM data must be cleaned first. Call clean_km_data() first.")
+        
+        def filter_by_mode_and_rd(mode):
+            mode_filter = self.cleaned_km_df['Mode of Transport'].str.lower() == mode.lower()
+            receipts = self.cleaned_km_df[mode_filter & (self.cleaned_km_df['R/D KM'].str.lower() == 'receipt')]
+            delivery = self.cleaned_km_df[mode_filter & (self.cleaned_km_df['R/D KM'].str.lower() == 'delivery')]
+            variance = self.cleaned_km_df[mode_filter & (self.cleaned_km_df['R/D KM'].str.lower() == 'variance')]
+            return pd.concat([receipts, delivery, variance], ignore_index=True)
+
+        modes = ['in-tank', 'barge', 'pipeline']
+        structured_dfs = []
+        
+        for mode in modes:
+            mode_df = filter_by_mode_and_rd(mode)
+            if not mode_df.empty:
+                structured_dfs.append(mode_df)
+
+        # Add variance-only records
+        variance_only = self.cleaned_km_df[self.cleaned_km_df['R/D KM'].str.lower() == 'variance']
+        if not variance_only.empty:
+            structured_dfs.append(variance_only)
+
+        if structured_dfs:
+            self.structured_km_df = pd.concat(structured_dfs, ignore_index=True).drop_duplicates().reset_index(drop=True)
+        else:
+            self.structured_km_df = pd.DataFrame()
+        
+        print(f"KM data structured: {len(self.structured_km_df)} records")
+        return self.structured_km_df
+
+    def process_all(self):
+        """Run the complete processing pipeline"""
+        print("Starting data processing pipeline...")
+        
+        # Clean data
+        self.clean_km_data()
+        self.clean_sap_data()
+        
+        # Structure data
+        self.structure_km_data()
+        self.structure_sap_data()
+        
+        print("Data processing pipeline completed successfully")
+        return self.structured_km_df, self.structured_sap_df
+
+class GasReconciler:
+    def __init__(self, km_df, sap_df, chunk_size=75):
+        self.km_df = km_df.copy()
+        self.sap_df = sap_df.copy()
+        self.chunk_size = chunk_size
+        self.matched_records = []
+        self.matched_sap_indices = set()
+
+    @staticmethod
+    def row_to_dict(row):
+        """Convert pandas row to dictionary, dropping NaN values"""
+        return row.dropna().to_dict()
+
+    @staticmethod
+    def chunk_list(data, chunk_size):
+        """Split data into chunks of specified size"""
+        for i in range(0, len(data), chunk_size):
+            yield data[i:i + chunk_size]
+
+    def get_system_prompt(self, km_row, sap_chunk):
+        return f"""
+You are a Highly Skilled Reconciliation Engine designed to match KM with SAP records. Operate with precision, accuracy and critical analysis.
+
+Input:
+- KM Record:
+{json.dumps(km_row, indent=2)}
+
+- SAP Records:
+{json.dumps(sap_chunk, indent=2)}
+
+Perform advanced matching using the following layered rules:
+
+1. DATE MATCHING:
+   - A strong match occurs when KM End Date/Time and SAP Movement Date are within ±2 days.
+   - If this condition is not met, other fields must show strong alignment to justify a match.
+
+2. TRANSPORT MODE MATCHING:
+   - Prefer matches where KM Mode of Transport == SAP MovementType.
+   - Allow fuzzy matching (e.g., "tank" ~ "in-tank", "in-tank" ~ "in-tank/inter-tank").
+
+3. R/D MATCHING:
+   - Prefer matches where KM R/D == SAP R/D.
+   - If R/D differs, match is acceptable only if other fields (e.g., date, Mode of Transport) are strongly aligned.
+
+4. VOLUME MATCHING:
+   - Match KM Custody Volume to the closest SAP Inventory Qty within a tolerance of ±250 units.
+   - Prioritize matches where other fields also align well.
+
+IMPORTANT:
+- Each SAP record can be matched only once across all KM records.
+- Once matched, a SAP record is excluded from future matches.
+- Be conservative with matches - only match if you're confident.
+
+Return only the final matched row in this format (pipe-separated, no explanation):
+
+End Date/Time|KM Order#|Customer Order #|BATCH #|Mode of Transport|Source Container|Destination Container|R/D KM|Product KM|Custody Volume|Product SAP|R/D SAP|MovementType|Movement Date|BOL|Nomination Number|Inventory Qty|ReconciliationStatus|MatchingCriteria
+
+Keep ReconciliationStatus and MatchingCriteria as the second last and last columns.
+Set ReconciliationStatus to 'MATCH' if a confident match is found, otherwise 'NO MATCH'.
+Set MatchingCriteria to briefly explain the key fields that led to the match using concise terms like:
+- "Date+Volume"
+- "Date+Volume+Mode"
+- "Volume+Mode"
+- "Volume+Mode+R/D"
+- "Date+Volume+Mode+R/D"
+- "All Fields"
+- "N/A" for no match
+"""
+    
+    def reconcile(self):
+        """Perform reconciliation between KM and SAP data"""
+        print(f"Starting reconciliation for {len(self.km_df)} KM records and {len(self.sap_df)} SAP records...")
+
+        for idx, km_row in tqdm(self.km_df.iterrows(), total=len(self.km_df), desc="Processing KM records"):
+            km_dict = self.row_to_dict(km_row)
+
+            # Pre-filter SAP records by date proximity
+            try:
+                km_date = pd.to_datetime(km_dict.get("End Date/Time"))
+                date_mask = (
+                    (pd.to_datetime(self.sap_df["Movement Date"]) >= km_date - timedelta(days=2)) &
+                    (pd.to_datetime(self.sap_df["Movement Date"]) <= km_date + timedelta(days=2))
+                )
+                sap_filtered = self.sap_df[date_mask]
+            except (ValueError, TypeError) as e:
+                print(f"Warning: Date filtering failed for KM record {idx}: {e}. Using all SAP records.")
+                sap_filtered = self.sap_df
+
+            # Remove already matched SAP records
+            sap_filtered = sap_filtered[~sap_filtered.index.isin(self.matched_sap_indices)]
+
+            if sap_filtered.empty:
+                self._append_no_match(km_dict)
+                continue
+
+            sap_records = [(i, self.row_to_dict(row)) for i, row in sap_filtered.iterrows()]
+            match_found = False
+
+            # Process SAP records in chunks
+            for chunk in self.chunk_list(sap_records, self.chunk_size):
+                sap_chunk_dicts = [record for _, record in chunk]
+                prompt = self.get_system_prompt(km_dict, sap_chunk_dicts)
+
+                try:
+                    response = AzureChatClient.init_openai_client.invoke(
+                        model=os.getenv("AZURE_DEPLOYMENT"),
+                        messages=[{"role": "system", "content": prompt}],
+                        temperature=0,
+                        max_tokens=1000,
+                    )
+                    output = response.choices[0].message.content.strip()
+                    fields = [field.strip() for field in output.split("|")]
+
+                    if len(fields) == 19:
+                        keys = [
+                            "End Date/Time", "KM Order#", "Customer Order #", "BATCH #",
+                            "Mode of Transport", "Source Container", "Destination Container", "R/D KM",
+                            "Product KM", "Custody Volume", "Product SAP", "R/D SAP", "MovementType",
+                            "Movement Date", "BOL", "Nomination Number", "Inventory Qty",
+                            "ReconciliationStatus", "MatchingCriteria"
+                        ]
+                        record = {key: field for key, field in zip(keys, fields)}
+
+                        if record["ReconciliationStatus"] == "MATCH":
+                            # Find the matching SAP record in the chunk
+                            for sap_idx, sap_row in chunk:
+                                bol_match = str(sap_row.get("BOL", "")).strip() == str(record["BOL"]).strip()
+                                nom_match = str(sap_row.get("Nomination Number", "")).strip() == str(record["Nomination Number"]).strip()
+
+                                if bol_match and nom_match:
+                                    self.matched_sap_indices.add(sap_idx)
+                                    self.matched_records.append(record)
+                                    match_found = True
+                                    break
+                            if match_found:
+                                break
+                    else:
+                        print(f"Warning: LLM returned unexpected format for KM record {idx}. Expected 19 fields, got {len(fields)}")
+
+                except Exception as e:
+                    print(f"Error: Matching failed at KM index {idx}: {e}")
+                    continue
+
+            if not match_found:
+                self._append_no_match(km_dict)
+
+        # Add unmatched SAP records
+        self._append_unmatched_sap()
+        print(f"Reconciliation complete. Total records: {len(self.matched_records)}")
+        return pd.DataFrame(self.matched_records)
+
+    def _append_no_match(self, km_dict):
+        """Add KM record with no match found"""
+        km_dict.update({
+            "Product SAP": None,
+            "R/D SAP": None,
+            "MovementType": None,
+            "Movement Date": None,
+            "BOL": None,
+            "Nomination Number": None,
+            "Inventory Qty": None,
+            "ReconciliationStatus": "NO MATCH",
+            "MatchingCriteria": "N/A"
+        })
+        self.matched_records.append(km_dict)
+
+    def _append_unmatched_sap(self):
+        """Add unmatched SAP records"""
+        for i, sap_row in self.sap_df.iterrows():
+            if i not in self.matched_sap_indices:
+                sap_dict = self.row_to_dict(sap_row)
+                sap_dict.update({
+                    "End Date/Time": None,
+                    "KM Order#": None,
+                    "Customer Order #": None,
+                    "BATCH #": None,
+                    "Mode of Transport": None,
+                    "Source Container": None,
+                    "Destination Container": None,
+                    "R/D KM": None,
+                    "Product KM": None,
+                    "Custody Volume": None,
+                    "ReconciliationStatus": "NO MATCH",
+                    "MatchingCriteria": "N/A"
+                })
+                self.matched_records.append(sap_dict)
+
+def get_GAS_report(matched_df):
+    """
+    Generate Excel report with reconciliation results organized by categories.
+    
+    Args:
+        matched_df: DataFrame with reconciliation results
+    
+    Returns:
+        bytes: Excel file as bytes
+    """
+    if matched_df is None or matched_df.empty:
+        raise ValueError("matched_df cannot be None or empty")
+    
+    df_matched = matched_df.copy()
+    VOLUME_TOLERANCE = 250
+    
+    # Convert volume columns to numeric
+    df_matched["Custody Volume"] = pd.to_numeric(df_matched["Custody Volume"], errors='coerce')
+    df_matched["Inventory Qty"] = pd.to_numeric(df_matched["Inventory Qty"], errors='coerce')
+    
+    # Calculate variance
+    df_matched["Variance"] = df_matched["Inventory Qty"] - df_matched["Custody Volume"]
+    
+    # Determine variance status
+    df_matched["Variance Status"] = np.where(
+        df_matched["Variance"].abs() <= VOLUME_TOLERANCE,
+        "Match",
+        "Open Item"
+    )
+    
+    # Update reconciliation status for partial matches
+    df_matched.loc[
+        (df_matched["Variance Status"] == "Open Item") &
+        (df_matched["ReconciliationStatus"] == "MATCH"),
+        "ReconciliationStatus"
+    ] = "PARTIAL MATCH"
+    
+    # Normalize text fields
+    def norm(s): 
+        return str(s).strip().upper() if pd.notna(s) else ""
+    
+    df_matched["Mode of Transport"] = df_matched["Mode of Transport"].apply(norm)
+    df_matched["R/D KM"] = df_matched["R/D KM"].apply(norm)
+    df_matched["ReconciliationStatus"] = df_matched["ReconciliationStatus"].apply(norm)
+    
+    # Define conditions for different report sections
+    conditions = {
+        "InTank-Receipts": (
+            (df_matched["Mode of Transport"] == "IN-TANK") &
+            (df_matched["R/D KM"] == "RECEIPT") &
+            (df_matched["ReconciliationStatus"] == "MATCH") &
+            (df_matched["Variance Status"] == "Match")
+        ),
+        "InTank-Delivery": (
+            (df_matched["Mode of Transport"] == "IN-TANK") &
+            (df_matched["R/D KM"] == "DELIVERY") &
+            (df_matched["ReconciliationStatus"] == "MATCH") &
+            (df_matched["Variance Status"] == "Match")
+        ),
+        "Pipeline-Receipts": (
+            (df_matched["Mode of Transport"] == "PIPELINE") &
+            (df_matched["R/D KM"] == "RECEIPT") &
+            (df_matched["ReconciliationStatus"] == "MATCH") &
+            (df_matched["Variance Status"] == "Match")
+        ),
+        "Pipeline-Delivery": (
+            (df_matched["Mode of Transport"] == "PIPELINE") &
+            (df_matched["R/D KM"] == "DELIVERY") &
+            (df_matched["ReconciliationStatus"] == "MATCH") &
+            (df_matched["Variance Status"] == "Match")
+        ),
+        "Barge-Vessel Receipts": (
+            (df_matched["Mode of Transport"].isin(["BARGE", "VESSEL"])) &
+            (df_matched["R/D KM"] == "RECEIPT") &
+            (df_matched["ReconciliationStatus"] == "MATCH") &
+            (df_matched["Variance Status"] == "Match")
+        ),
+        "Barge-Vessel Delivery": (
+            (df_matched["Mode of Transport"].isin(["BARGE", "VESSEL"])) &
+            (df_matched["R/D KM"] == "DELIVERY") &
+            (df_matched["ReconciliationStatus"] == "MATCH") &
+            (df_matched["Variance Status"] == "Match")
+        ),
+        "Open Items": (
+            (df_matched["Variance Status"] == "Open Item") |
+            (df_matched["ReconciliationStatus"] != "MATCH")
+        )
+    }
+    
+    # Define column groupings
+    common_km_cols = ['End Date/Time', 'KM Order#', 'Customer Order #', 'BATCH #', 'Mode of Transport',
+                      'Source Container', 'Destination Container', 'R/D KM', 'Product KM', 'Custody Volume']
+    common_sap_cols = ['Product SAP', 'R/D SAP', 'MovementType', 'Movement Date', 'BOL',
+                       'Nomination Number', 'Inventory Qty']
+    result_cols = ['ReconciliationStatus', 'MatchingCriteria', 'Variance', 'Variance Status']
+    desired_order = common_km_cols + common_sap_cols + result_cols
+    
+    column_groupings = {
+        sheet: {
+            "KinderMorgan": common_km_cols,
+            "SAP": common_sap_cols,
+            "Result": result_cols
+        } for sheet in conditions.keys()
+    }
+    
+    # Create Excel file
+    output = BytesIO()
+    try:
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            for sheet_name, condition in conditions.items():
+                df_filtered = df_matched[condition].copy()
+                
+                if df_filtered.empty:
+                    # Create empty sheet with headers
+                    df_filtered = pd.DataFrame(columns=desired_order)
+                
+                # Ensure all desired columns exist
+                for col in desired_order:
+                    if col not in df_filtered.columns:
+                        df_filtered[col] = None
+                
+                df_filtered = df_filtered[desired_order]
+                
+                # Create multi-level column headers
+                multi_cols = []
+                for col in df_filtered.columns:
+                    if col in column_groupings[sheet_name]["KinderMorgan"]:
+                        multi_cols.append((f"{sheet_name} GAS Reconciliation", "KinderMorgan", col))
+                    elif col in column_groupings[sheet_name]["SAP"]:
+                        multi_cols.append((f"{sheet_name} GAS Reconciliation", "SAP", col))
+                    elif col in column_groupings[sheet_name]["Result"]:
+                        multi_cols.append((f"{sheet_name} GAS Reconciliation", "Result", col))
+                    else:
+                        multi_cols.append((f"{sheet_name} GAS Reconciliation", "Other", col))
+                
+                df_filtered.columns = pd.MultiIndex.from_tuples(multi_cols)
+                df_filtered.to_excel(writer, sheet_name=sheet_name, index=True)
+        
+        output.seek(0)
+        return output.getvalue()
+        
+    except Exception as e:
+        print(f"Error generating Excel report: {e}")
+        raise
+
+# Main execution function
+def run_gas_reconciliation_pipeline(sap_base_gas_df, km_base_gas_df, chunk_size=75):
+    """
+    Complete pipeline for gas data reconciliation
+    
+    Args:
+        sap_base_gas_df: Input SAP DataFrame
+        km_base_gas_df: Input KM DataFrame  
+        chunk_size: Size of chunks for LLM processing
+    
+    Returns:
+        tuple: (matched_df, excel_bytes)
+    """
+    try:
+        # Step 1: Process and clean data
+        processor = GasDataProcessor(sap_base_gas_df, km_base_gas_df)
+        structured_km_df, structured_sap_df = processor.process_all()
+        
+        # Step 2: Reconcile data
+        reconciler = GasReconciler(structured_km_df, structured_sap_df, chunk_size=chunk_size)
+        matched_df = reconciler.reconcile()
+        
+        # Step 3: Generate report
+        excel_bytes = get_GAS_report(matched_df)
+        
+        return matched_df, excel_bytes
+        
+    except Exception as e:
+        print(f"Pipeline execution failed: {e}")
+        raise
+
+# Example usage:
+# matched_df, excel_bytes = run_gas_reconciliation_pipeline(sap_df, km_df)
+# with open("gas_reconciliation_report.xlsx", "wb") as f:
+#     f.write(excel_bytes)
